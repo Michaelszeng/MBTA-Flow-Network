@@ -3,9 +3,68 @@ from pathlib import Path
 import pandas as pd
 from utils import filter_routes_by_type, load_gtfs_data
 
+# Time period definitions (approximate based on MBTA standards)
+TIME_PERIOD_RANGES = {
+    'VERY_EARLY_MORNING': ('00:00:00', '05:59:59'),
+    'EARLY_AM': ('06:00:00', '06:59:59'),
+    'AM_PEAK': ('07:00:00', '08:59:59'),
+    'MIDDAY_SCHOOL': ('09:00:00', '11:59:59'),
+    'MIDDAY_BASE': ('12:00:00', '14:59:59'),
+    'PM_PEAK': ('15:00:00', '17:59:59'),
+    'EVENING': ('18:00:00', '21:59:59'),
+    'LATE_EVENING': ('22:00:00', '23:59:59'),
+    'NIGHT': ('00:00:00', '02:59:59'),
+    'OFF_PEAK': ('09:00:00', '14:59:59')  # Fallback for generic off-peak
+}
+
+# Average headway (minutes between trains) for rail lines
+AVERAGE_HEADWAY_MINUTES = 5.0  # Assume one train every 5 minutes
+
+def calculate_trips_from_headway(time_period):
+    """
+    Calculate number of trips based on time period duration and assumed headway.
+    Simple approach: assumes one train every AVERAGE_HEADWAY_MINUTES in each direction.
+    
+    Parameters:
+    -----------
+    time_period : str
+        Time period name (e.g., 'PM_PEAK', 'EVENING')
+    
+    Returns:
+    --------
+    int
+        Estimated number of trips in one direction during the time period
+    """
+    # Get time range for the period
+    if time_period not in TIME_PERIOD_RANGES:
+        print(f"    Warning: Time period '{time_period}' not defined. Using 4-hour default.")
+        duration_minutes = 240  # 4 hours default
+    else:
+        start_time, end_time = TIME_PERIOD_RANGES[time_period]
+        # Parse times to get duration
+        start_parts = start_time.split(':')
+        end_parts = end_time.split(':')
+        start_minutes = int(start_parts[0]) * 60 + int(start_parts[1])
+        end_minutes = int(end_parts[0]) * 60 + int(end_parts[1])
+        
+        # Handle case where end_time is earlier than start_time (crosses midnight)
+        if end_minutes < start_minutes:
+            duration_minutes = (24 * 60 - start_minutes) + end_minutes
+        else:
+            duration_minutes = end_minutes - start_minutes
+    
+    # Calculate number of trips: duration / headway
+    num_trips = int(duration_minutes / AVERAGE_HEADWAY_MINUTES)
+    
+    print(f"    Using simplified trip calculation: {num_trips} trips per direction")
+    print(f"    ({duration_minutes} minutes ÷ {AVERAGE_HEADWAY_MINUTES} min/train = ~{num_trips} trains)")
+    
+    return num_trips
+
 
 def add_bus_flow_to_edges(edges_df, ridership_filepath, stops_df,
-                          day_type='weekday', time_period='PM_PEAK'):
+                          day_type='weekday', time_period='PM_PEAK',
+                          normalize=False):
     """
     Add ridership flow data to edges DataFrame for bus routes.
     
@@ -21,11 +80,13 @@ def add_bus_flow_to_edges(edges_df, ridership_filepath, stops_df,
         Day type to filter (e.g., 'weekday', 'saturday', 'sunday')
     time_period : str
         Time period to filter (e.g., 'PM_PEAK', 'AM_PEAK', 'OFF_PEAK')
+    normalize : bool
+        Not used for buses (average_load is already per-bus)
     
     Returns:
     --------
     pd.DataFrame
-        edges_df with added 'flow' column
+        edges_df with added 'flow' column (average_load per bus)
     """
     # Load ridership data
     ridership = pd.read_csv(ridership_filepath)
@@ -94,11 +155,15 @@ def add_bus_flow_to_edges(edges_df, ridership_filepath, stops_df,
             if edges_with_flow.at[idx, 'flow'] > 0:
                 break
     
+    # Note: Bus data already represents average_load (per-bus), so normalization not needed
+    # This section is kept for compatibility but normalize should be False for buses
+    
     return edges_with_flow
 
 
 def add_rail_flow_to_edges(edges_df, ridership_filepath, stop_orders_filepath, 
-                           day_type='Weekday', time_period='PM_PEAK'):
+                           day_type='Weekday', time_period='PM_PEAK',
+                           normalize=True):
     """
     Add ridership flow data to edges DataFrame for rail lines.
     
@@ -114,11 +179,13 @@ def add_rail_flow_to_edges(edges_df, ridership_filepath, stop_orders_filepath,
         Day type to filter (e.g., 'Weekday', 'Saturday', 'Sunday')
     time_period : str
         Time period to filter (e.g., 'PM_PEAK', 'AM_PEAK', 'OFF_PEAK')
+    normalize : bool
+        If True, normalize flow to average passengers per train (assumes 5-minute headways)
     
     Returns:
     --------
     pd.DataFrame
-        edges_df with added 'flow' column
+        edges_df with added 'flow' column (normalized if normalize=True)
     """
     # Load ridership data
     ridership = pd.read_csv(ridership_filepath)
@@ -152,6 +219,7 @@ def add_rail_flow_to_edges(edges_df, ridership_filepath, stop_orders_filepath,
     # Copy edges_df to avoid modifying original
     edges_with_flow = edges_df.copy()
     edges_with_flow['flow'] = 0.0
+    edges_with_flow['direction_id'] = -1  # Track which direction this edge belongs to
     
     # Process each edge
     for idx, edge in edges_with_flow.iterrows():
@@ -165,6 +233,7 @@ def add_rail_flow_to_edges(edges_df, ridership_filepath, stop_orders_filepath,
         # Find the direction by checking stop orders
         # Look for this edge in stop orders for each direction
         edge_flows = []
+        edge_directions = []
         
         for direction in [0, 1]:
             # Get all stop sequences for this route and direction
@@ -198,14 +267,31 @@ def add_rail_flow_to_edges(edges_df, ridership_filepath, stop_orders_filepath,
                             if len(flow_data) > 0:
                                 flow_value = flow_data['average_flow'].iloc[0]
                                 edge_flows.append(flow_value)
+                                edge_directions.append(direction)
                                 break  # Found a match, no need to check other patterns
                 except ValueError:
                     # source_id not in this pattern's stop list, try next pattern
                     continue
         
-        # Aggregate flows (if edge exists in both directions, sum them)
-        # Or use the maximum, or average - depends on what you want
+        # Store flow and direction
+        # If edge exists in both directions, sum flows and use first direction found
         if edge_flows:
-            edges_with_flow.at[idx, 'flow'] = sum(edge_flows)  # Sum bidirectional flows
+            edges_with_flow.at[idx, 'flow'] = sum(edge_flows)
+            edges_with_flow.at[idx, 'direction_id'] = edge_directions[0] if edge_directions else -1
+    
+    # Normalize by trip count if requested
+    if normalize:
+        print("  Normalizing rail flow by estimated trip count...")
+        # Calculate trips based on headway assumption (simple approach)
+        trips_per_direction = calculate_trips_from_headway(time_period)
+        
+        # Normalize: flow per train = total flow / number of trips
+        # The flow data is already directional, so we divide by trips in that direction
+        for idx, edge in edges_with_flow.iterrows():
+            flow = edge.get('flow', 0)
+            if flow > 0:
+                edges_with_flow.at[idx, 'flow'] = flow / trips_per_direction
+        
+        print(f"  Normalized: average flow per train = total flow / {trips_per_direction} trips")
     
     return edges_with_flow

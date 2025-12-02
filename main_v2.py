@@ -4,13 +4,17 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from data_extraction import add_bus_flow_to_edges, add_rail_flow_to_edges
+from flow import add_bus_flow_to_edges, add_rail_flow_to_edges
+from travel_times_v3 import (add_travel_times_to_graph,
+                             load_travel_times_from_gtfs)
 from utils import ROUTE_COLORS, filter_routes_by_type, load_gtfs_data
 
 # Hardcoded variables
 MODE = "bus_and_rail"  # Options: "bus_only", "rail_only", "bus_and_rail"
 DIRECTED_EDGES = True  # True = show directional arrows, False = undirected edges
 SHOW_FLOW_LABELS = True  # True = show flow numbers on edges, False = hide flow labels
+NORMALIZE_FLOW = True  # True = normalize to avg passengers per train, False = total flow in time period (note: doesn't affect bus data which is already normalized to # ppl per bus)
+SHOW_TRAVEL_TIMES_LABELS = True  # True = add travel time weights to edges, False = skip travel time data
 
 # Ridership data filters
 DAY_TYPE = "Weekday"  # Options: "Weekday", "Saturday", "Sunday" (case-sensitive for rail, lowercase for bus)
@@ -22,7 +26,12 @@ ROUTE_TYPES = {
     'bus_and_rail': [0, 1, 3]
 }
 
-BUS_LINES = ["1", "70", "CT2", "64", "68", "47", "SL1", "83"]  # Only lines that >= 3 people listed
+BUS_LINES = ["1", "70", "747", "64", "68", "47", "741", "83"]  # Only lines that >= 3 people listed (747=CT2, 741=SL1)
+
+SIMULATE_LINE_CLOSURE = ""  # List of lines to close (e.g. "70", "747", "Red", "Green-D", or empty string to indicate no line closure)
+
+# Radius for identifying stations near key/campus locations (in degrees, approximately 200 meters)
+KEY_LOCATION_RADIUS = 0.004
 
 # Key locations to mark on the map (longitude, latitude)
 KEY_LOCATIONS = {
@@ -31,6 +40,12 @@ KEY_LOCATIONS = {
     'Back Bay': {'lon': -71.0810, 'lat': 42.3503},
     'Fenway/Kenmore': {'lon': -71.0972, 'lat': 42.3472},
     'Downtown': {'lon': -71.0589, 'lat': 42.3601}
+}
+
+# Campus locations to mark on the map (longitude, latitude)
+CAMPUS_LOCATIONS = {
+    'West Campus': {'lon': -71.10475, 'lat': 42.35396},  # Approximately West Briggs field
+    'East Campus': {'lon': -71.085528, 'lat': 42.360472}
 }
 
 
@@ -50,10 +65,82 @@ def consolidate_to_parent_stations(stop_id, stops_dict):
         return stop_id
 
 
+def calculate_distance(lon1, lat1, lon2, lat2):
+    """Calculate Euclidean distance between two (lon, lat) points.
+    
+    For small distances, this is a reasonable approximation.
+    """
+    return np.sqrt((lon2 - lon1)**2 + (lat2 - lat1)**2)
+
+
+def identify_key_stations(G, pos, key_locations, campus_locations, radius):
+    """Identify stations within radius of key/campus locations.
+    
+    Parameters:
+    -----------
+    G : networkx.Graph
+        The network graph
+    pos : dict
+        Dictionary mapping node IDs to (lon, lat) tuples
+    key_locations : dict
+        Dictionary of key location names to {'lon': x, 'lat': y} dicts
+    campus_locations : dict
+        Dictionary of campus location names to {'lon': x, 'lat': y} dicts
+    radius : float
+        Distance threshold in degrees
+    
+    Returns:
+    --------
+    dict : Mapping of node_id to location_name for nodes near key/campus locations
+    """
+    key_stations = {}
+    
+    # Combine all locations
+    all_locations = {}
+    all_locations.update(key_locations)
+    all_locations.update(campus_locations)
+    
+    # Check each node against each location
+    for node_id in G.nodes():
+        if node_id not in pos:
+            continue
+        
+        node_lon, node_lat = pos[node_id]
+        
+        for location_name, coords in all_locations.items():
+            loc_lon = coords['lon']
+            loc_lat = coords['lat']
+            
+            distance = calculate_distance(node_lon, node_lat, loc_lon, loc_lat)
+            
+            if distance <= radius:
+                # If node is near multiple locations, keep the closest one
+                if node_id in key_stations:
+                    # Check if this location is closer
+                    existing_loc = key_stations[node_id]['location']
+                    existing_coords = all_locations[existing_loc]
+                    existing_dist = calculate_distance(
+                        node_lon, node_lat, 
+                        existing_coords['lon'], existing_coords['lat']
+                    )
+                    if distance < existing_dist:
+                        key_stations[node_id] = {
+                            'location': location_name,
+                            'distance': distance
+                        }
+                else:
+                    key_stations[node_id] = {
+                        'location': location_name,
+                        'distance': distance
+                    }
+    
+    return key_stations
+
+
 def create_edges_from_gtfs(stops, stop_times, trips, routes, route_types, 
                            ridership_filepath=None, stop_orders_filepath=None,
                            day_type='Weekday', time_period='PM_PEAK',
-                           ridership_type='rail', specific_routes=None):
+                           ridership_type='rail', specific_routes=None, normalize_flow=True):
     """
     Create network edges from GTFS data with optional ridership flow data.
     
@@ -75,6 +162,8 @@ def create_edges_from_gtfs(stops, stop_times, trips, routes, route_types,
         Type of ridership data: 'rail' or 'bus' (default: 'rail')
     specific_routes : list, optional
         List of specific route IDs to include. If provided, only these routes will be included.
+    normalize_flow : bool
+        If True (rail only), normalize flow to average passengers per train using 5-minute headway assumption (default: True)
     """
     # Filter routes by type (i.e. bus_only, rail_only, bus_and_rail)
     filtered_routes = filter_routes_by_type(routes, route_types)
@@ -144,13 +233,15 @@ def create_edges_from_gtfs(stops, stop_times, trips, routes, route_types,
     # Add ridership flow data if paths provided
     if ridership_filepath:
         print(f"  Adding {ridership_type} ridership flow data ({day_type}, {time_period})...")
+        
         if ridership_type == 'rail' and stop_orders_filepath:
             edges_df = add_rail_flow_to_edges(
                 edges_df,
                 ridership_filepath,
                 stop_orders_filepath,
                 day_type=day_type,
-                time_period=time_period
+                time_period=time_period,
+                normalize=normalize_flow
             )
         elif ridership_type == 'bus':
             edges_df = add_bus_flow_to_edges(
@@ -158,7 +249,8 @@ def create_edges_from_gtfs(stops, stop_times, trips, routes, route_types,
                 ridership_filepath,
                 stops,
                 day_type=day_type,
-                time_period=time_period
+                time_period=time_period,
+                normalize=False  # Bus data is already per-bus load
             )
         print(f"  Added flow data: {(edges_df['flow'] > 0).sum()} edges with ridership")
     
@@ -349,7 +441,7 @@ def create_arrow_triangle(curve_x, curve_y, color, arrow_distance=0.0019, arrow_
     return arrow_trace
 
 
-def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_flow_labels=True):
+def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_flow_labels=True, show_travel_time_labels=True):
     """Create an interactive network graph using Plotly with color-coded routes and curved bi-directional edges.
     
     Parameters:
@@ -358,6 +450,8 @@ def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_
         If True, show directional arrows on edges. If False, show undirected edges.
     show_flow_labels : bool
         If True, display flow numbers on edges. If False, hide flow labels.
+    show_travel_time_labels : bool
+        If True, display travel time labels on edges. If False, hide travel time labels.
     """
     # Identify bi-directional edges
     bidirectional_edges = set()
@@ -383,6 +477,7 @@ def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_
     # Create edge traces grouped by route
     edge_traces = []
     flow_label_traces = []
+    travel_time_label_traces = []
     drawn_undirected_edges = set()  # Track drawn edges when undirected to avoid duplicates
     
     for route_id, edges in route_edges.items():
@@ -455,6 +550,9 @@ def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_
                 hover_text = f'{node_labels.get(u, u)} {direction_symbol} {node_labels.get(v, v)}<br>Route: {route_id}<br>Weight: {weight}'
                 if flow is not None and flow > 0:
                     hover_text += f'<br>Flow: {flow:.0f} riders'
+                travel_time_sec = data.get('travel_time_sec', None)
+                if travel_time_sec is not None:
+                    hover_text += f'<br>Travel Time: {travel_time_sec:.0f} sec'
                 
                 edge_trace = go.Scatter(
                     x=curve_x,
@@ -488,12 +586,29 @@ def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_
                         y=[label_y],
                         mode='text',
                         text=[f'{flow:.0f}'],
-                        textfont=dict(size=9, color='black'),
+                        textfont=dict(size=9, color='black', weight='bold'),
                         textposition='middle center',
                         hoverinfo='skip',
                         showlegend=False
                     )
                     flow_label_traces.append(flow_label)
+                
+                # Add travel time label if travel time data exists
+                travel_time_sec = data.get('travel_time_sec', None)
+                if show_travel_time_labels and travel_time_sec is not None:
+                    # Offset label position slightly below midpoint for travel times
+                    offset_y = -0.0008  # Small offset in latitude
+                    travel_time_label = go.Scatter(
+                        x=[label_x],
+                        y=[label_y + offset_y],
+                        mode='text',
+                        text=[f'{travel_time_sec:.0f}s'],
+                        textfont=dict(size=8, color='darkblue'),
+                        textposition='middle center',
+                        hoverinfo='skip',
+                        showlegend=False
+                    )
+                    travel_time_label_traces.append(travel_time_label)
                 
             else:
                 # Use straight line for uni-directional edges or when undirected
@@ -537,12 +652,29 @@ def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_
                         y=[my],
                         mode='text',
                         text=[f'{flow:.0f}'],
-                        textfont=dict(size=9, color='black'),
+                        textfont=dict(size=9, color='black', weight='bold'),
                         textposition='middle center',
                         hoverinfo='skip',
                         showlegend=False
                     )
                     flow_label_traces.append(flow_label)
+                
+                # Add travel time label if travel time data exists
+                travel_time_sec = data.get('travel_time_sec', None)
+                if show_travel_time_labels and travel_time_sec is not None:
+                    # Offset label position slightly below midpoint for travel times
+                    offset_y = -0.0008  # Small offset in latitude
+                    travel_time_label = go.Scatter(
+                        x=[mx],
+                        y=[my + offset_y],
+                        mode='text',
+                        text=[f'{travel_time_sec:.0f}s'],
+                        textfont=dict(size=8, color='darkblue'),
+                        textposition='middle center',
+                        hoverinfo='skip',
+                        showlegend=False
+                    )
+                    travel_time_label_traces.append(travel_time_label)
     
     # Create a legend trace for each route
     # Consolidate all bus routes (default gray color) into a single "Bus Route" entry
@@ -663,6 +795,39 @@ def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_
                 )
                 node_traces.append(node_trace)
     
+    # Create star markers for stations near key/campus locations
+    key_station_traces = []
+    key_station_x = []
+    key_station_y = []
+    key_station_text = []
+    
+    for node in G.nodes():
+        if G.nodes[node].get('is_key_station', False):
+            x, y = pos[node]
+            key_station_x.append(x)
+            key_station_y.append(y)
+            location_name = G.nodes[node].get('key_location', 'Unknown')
+            station_name = node_labels.get(node, node)
+            key_station_text.append(f'{station_name}<br>Near: {location_name}')
+    
+    if key_station_x:
+        key_station_trace = go.Scatter(
+            x=key_station_x,
+            y=key_station_y,
+            mode='markers',
+            marker=dict(
+                symbol='star',
+                size=6,
+                color='gold',
+                line=dict(width=1, color='orange')
+            ),
+            hovertemplate='<b>%{text}</b><extra></extra>',
+            text=key_station_text,
+            showlegend=True,
+            name='Stations Near Key/Campus Locations'
+        )
+        key_station_traces.append(key_station_trace)
+    
     # Create markers for key locations
     key_location_traces = []
     for location_name, coords in KEY_LOCATIONS.items():
@@ -679,12 +844,35 @@ def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_
             ),
             text=[location_name],
             textposition='top center',
-            textfont=dict(size=10, color='darkred', family='Arial Black'),
+            textfont=dict(size=20, color='darkred', family='Arial Black'),
             hovertemplate=f'<b>{location_name}</b><br>Lon: {coords["lon"]:.4f}<br>Lat: {coords["lat"]:.4f}<extra></extra>',
             showlegend=False,
             name=location_name
         )
         key_location_traces.append(marker_trace)
+    
+    # Create markers for campus locations (blue)
+    campus_location_traces = []
+    for location_name, coords in CAMPUS_LOCATIONS.items():
+        # Main marker (triangle pointing down like a map pin)
+        marker_trace = go.Scatter(
+            x=[coords['lon']],
+            y=[coords['lat']],
+            mode='markers+text',
+            marker=dict(
+                symbol='triangle-down',
+                size=20,
+                color='blue',
+                line=dict(width=2, color='darkblue')
+            ),
+            text=[location_name],
+            textposition='top center',
+            textfont=dict(size=20, color='darkblue', family='Arial Black'),
+            hovertemplate=f'<b>{location_name}</b><br>Lon: {coords["lon"]:.4f}<br>Lat: {coords["lat"]:.4f}<extra></extra>',
+            showlegend=False,
+            name=location_name
+        )
+        campus_location_traces.append(marker_trace)
     
     # Add a single legend entry for all key locations
     key_locations_legend = go.Scatter(
@@ -701,63 +889,177 @@ def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_
         showlegend=True
     )
     
+    # Add a single legend entry for all campus locations
+    campus_locations_legend = go.Scatter(
+        x=[None],
+        y=[None],
+        mode='markers',
+        marker=dict(
+            symbol='triangle-down',
+            size=15,
+            color='blue',
+            line=dict(width=2, color='darkblue')
+        ),
+        name='Campus Locations',
+        showlegend=True
+    )
+    
     # Create figure
+    # Note: Traces are added in order, with later traces appearing on top
+    # Key locations and campus locations are added last so they appear above everything else
     mode_display = mode.replace('_', ' ').title()
-    fig = go.Figure(data=legend_traces + [key_locations_legend] + edge_traces + flow_label_traces + node_traces + 
-                    key_location_traces + bus_node_traces_with_labels + bus_node_traces_without_labels)
+    fig = go.Figure(data=legend_traces + [key_locations_legend, campus_locations_legend] + edge_traces + flow_label_traces + 
+                    travel_time_label_traces + node_traces + bus_node_traces_with_labels + bus_node_traces_without_labels + 
+                    key_station_traces + key_location_traces + campus_location_traces)
     
-    # Calculate trace indices for the toggle button
-    num_traces_before_bus = (len(legend_traces) + 1 + len(edge_traces) + len(flow_label_traces) + 
-                             len(node_traces) + len(key_location_traces))
+    # Calculate trace indices for toggle buttons
+    num_legend_traces = len(legend_traces) + 2  # +2 for key_locations_legend and campus_locations_legend
+    num_edge_traces = len(edge_traces)
+    num_flow_label_traces = len(flow_label_traces)
+    num_travel_time_label_traces = len(travel_time_label_traces)
+    num_node_traces = len(node_traces)
     num_bus_traces = len(bus_node_traces_with_labels)
+    num_key_station_traces = len(key_station_traces)
+    num_key_location_traces = len(key_location_traces)
+    num_campus_location_traces = len(campus_location_traces)
     
-    # Create visibility arrays for the button
-    # We need to specify visibility for ALL traces in the figure
-    total_traces = num_traces_before_bus + 2 * num_bus_traces
+    # Calculate trace positions
+    idx = 0
+    legend_idx = idx
+    idx += num_legend_traces
+    edge_idx = idx
+    idx += num_edge_traces
+    flow_idx = idx
+    idx += num_flow_label_traces
+    travel_time_idx = idx
+    idx += num_travel_time_label_traces
+    node_idx = idx
+    idx += num_node_traces
+    bus_with_labels_idx = idx
+    idx += num_bus_traces
+    bus_without_labels_idx = idx
+    idx += num_bus_traces
+    key_station_idx = idx
+    idx += num_key_station_traces
+    key_location_idx = idx
+    idx += num_key_location_traces
+    campus_location_idx = idx
     
-    # Show labels: all traces visible except bus_without_labels
-    show_labels_visibility = [True] * num_traces_before_bus + \
-                            [True] * num_bus_traces + \
-                            [False] * num_bus_traces
+    total_traces = idx + num_campus_location_traces
     
-    # Hide labels: all traces visible except bus_with_labels
-    hide_labels_visibility = [True] * num_traces_before_bus + \
-                            [False] * num_bus_traces + \
-                            [True] * num_bus_traces
+    # Create list of trace indices for each type
+    flow_trace_indices = list(range(flow_idx, flow_idx + num_flow_label_traces))
+    travel_time_trace_indices = list(range(travel_time_idx, travel_time_idx + num_travel_time_label_traces))
+    bus_with_labels_indices = list(range(bus_with_labels_idx, bus_with_labels_idx + num_bus_traces))
+    bus_without_labels_indices = list(range(bus_without_labels_idx, bus_without_labels_idx + num_bus_traces))
     
-    # Add toggle button for bus route labels
+    # Add toggle buttons (using restyle to only modify specific traces)
     updatemenus = []
-    if num_bus_traces > 0:  # Only add button if there are bus routes
-        updatemenus = [
+    
+    # Flow labels toggle button
+    if num_flow_label_traces > 0:
+        updatemenus.append(
             dict(
                 type="buttons",
                 direction="left",
                 buttons=[
                     dict(
-                        args=[{"visible": show_labels_visibility}],
-                        label="Show Bus Labels",
-                        method="update"
+                        args=[{"visible": True}, flow_trace_indices],
+                        label="Flow",
+                        method="restyle"
                     ),
                     dict(
-                        args=[{"visible": hide_labels_visibility}],
-                        label="Hide Bus Labels",
-                        method="update"
+                        args=[{"visible": False}, flow_trace_indices],
+                        label="No Flow",
+                        method="restyle"
                     )
                 ],
-                pad={"r": 10, "t": 10},
+                pad={"r": 5, "t": 5},
                 showactive=True,
                 x=0.01,
                 xanchor="left",
-                y=1.15,
-                yanchor="top"
+                y=1.12,
+                yanchor="top",
+                bgcolor="rgba(255, 255, 255, 0.8)",
+                borderwidth=1,
+                bordercolor="gray",
+                font=dict(size=10)
             )
-        ]
+        )
+    
+    # Travel time labels toggle button
+    if num_travel_time_label_traces > 0:
+        updatemenus.append(
+            dict(
+                type="buttons",
+                direction="left",
+                buttons=[
+                    dict(
+                        args=[{"visible": True}, travel_time_trace_indices],
+                        label="Times",
+                        method="restyle"
+                    ),
+                    dict(
+                        args=[{"visible": False}, travel_time_trace_indices],
+                        label="No Times",
+                        method="restyle"
+                    )
+                ],
+                pad={"r": 5, "t": 5},
+                showactive=True,
+                x=0.01,
+                xanchor="left",
+                y=1.08,
+                yanchor="top",
+                bgcolor="rgba(255, 255, 255, 0.8)",
+                borderwidth=1,
+                bordercolor="gray",
+                font=dict(size=10)
+            )
+        )
+    
+    # Bus labels toggle button
+    if num_bus_traces > 0:
+        # Combine both sets of bus trace indices
+        all_bus_indices = bus_with_labels_indices + bus_without_labels_indices
+        # Create visibility patterns: show with_labels + hide without_labels
+        show_labels_pattern = [True] * num_bus_traces + [False] * num_bus_traces
+        hide_labels_pattern = [False] * num_bus_traces + [True] * num_bus_traces
+        
+        updatemenus.append(
+            dict(
+                type="buttons",
+                direction="left",
+                buttons=[
+                    dict(
+                        args=[{"visible": show_labels_pattern}, all_bus_indices],
+                        label="Bus Labels",
+                        method="restyle"
+                    ),
+                    dict(
+                        args=[{"visible": hide_labels_pattern}, all_bus_indices],
+                        label="No Bus Labels",
+                        method="restyle"
+                    )
+                ],
+                pad={"r": 5, "t": 5},
+                showactive=True,
+                x=0.01,
+                xanchor="left",
+                y=1.04,
+                yanchor="top",
+                bgcolor="rgba(255, 255, 255, 0.8)",
+                borderwidth=1,
+                bordercolor="gray",
+                font=dict(size=10)
+            )
+        )
     
     fig.update_layout(
-        title=dict(
-            text=f'MBTA Network - {mode_display}',
-            font=dict(size=20)
-        ),
+        # title=dict(
+        #     text=f'MBTA Network - {mode_display}',
+        #     font=dict(size=20)
+        # ),
         xaxis=dict(
             title='Longitude',
             showgrid=True,
@@ -828,17 +1130,20 @@ def main():
             stop_orders_filepath=stop_orders_file,
             day_type=DAY_TYPE,
             time_period=TIME_PERIOD,
-            ridership_type='rail'
+            ridership_type='rail',
+            normalize_flow=NORMALIZE_FLOW
         )
     elif MODE == 'bus_only':
         # Bus only with ridership (filtered to specific bus lines)
+        # Note: Bus data already shows average_load (passengers per bus), so don't normalize
         edges_df = create_edges_from_gtfs(
             stops, stop_times, trips, routes, [3],
             ridership_filepath=bus_ridership_file,
             day_type=DAY_TYPE.lower(),  # Bus data uses lowercase
             time_period=TIME_PERIOD,
             ridership_type='bus',
-            specific_routes=BUS_LINES
+            specific_routes=BUS_LINES,
+            normalize_flow=False  # Bus data is already per-bus load
         )
     else:  # bus_and_rail
         # Create rail edges with rail ridership
@@ -849,12 +1154,14 @@ def main():
             stop_orders_filepath=stop_orders_file,
             day_type=DAY_TYPE,
             time_period=TIME_PERIOD,
-            ridership_type='rail'
+            ridership_type='rail',
+            normalize_flow=NORMALIZE_FLOW
         )
         rail_with_flow = (rail_edges['flow'] > 0).sum() if 'flow' in rail_edges.columns else 0
         print(f"    Rail: {len(rail_edges)} edges, {rail_with_flow} with flow data")
         
         # Create bus edges with bus ridership (filtered to specific bus lines)
+        # Note: Bus data already shows average_load (passengers per bus), so don't normalize
         print("  Creating bus edges...")
         bus_edges = create_edges_from_gtfs(
             stops, stop_times, trips, routes, [3],
@@ -862,7 +1169,8 @@ def main():
             day_type=DAY_TYPE.lower(),  # Bus data uses lowercase
             time_period=TIME_PERIOD,
             ridership_type='bus',
-            specific_routes=BUS_LINES
+            specific_routes=BUS_LINES,
+            normalize_flow=False  # Bus data is already per-bus load
         )
         bus_with_flow = (bus_edges['flow'] > 0).sum() if 'flow' in bus_edges.columns else 0
         print(f"    Bus: {len(bus_edges)} edges, {bus_with_flow} with flow data")
@@ -877,10 +1185,37 @@ def main():
     G, pos, node_labels, node_routes = create_graph_with_positions(edges_df, stops)
     print(f"  {G.number_of_nodes()} stations, {G.number_of_edges()} connections")
     
+    # Identify stations near key/campus locations
+    print("\nIdentifying stations near key/campus locations...")
+    key_stations = identify_key_stations(G, pos, KEY_LOCATIONS, CAMPUS_LOCATIONS, KEY_LOCATION_RADIUS)
+    print(f"  Found {len(key_stations)} stations within {KEY_LOCATION_RADIUS} degrees of key/campus locations:")
+    for station_id, info in key_stations.items():
+        station_name = node_labels.get(station_id, station_id)
+        print(f"    - {station_name} -> {info['location']} (distance: {info['distance']:.4f})")
+    
+    # Add key station attribute to graph nodes
+    for node in G.nodes():
+        if node in key_stations:
+            G.nodes[node]['is_key_station'] = True
+            G.nodes[node]['key_location'] = key_stations[node]['location']
+        else:
+            G.nodes[node]['is_key_station'] = False
+    
+    # Add travel time weights to edges (only for rail modes)
+    if SHOW_TRAVEL_TIMES_LABELS and MODE in ['rail_only', 'bus_and_rail']:
+        print("\nAdding travel time data from GTFS schedules...")
+        try:
+            travel_times_df = load_travel_times_from_gtfs(gtfs_folder, stops_df=stops)
+            add_travel_times_to_graph(G, travel_times_df)
+        except Exception as e:
+            print(f"  Warning: Could not load travel time data: {e}")
+            print(f"  Continuing without travel times...")
+    
     # Generate interactive visualization
-    print("Generating visualization...")
+    print("\nGenerating visualization...")
     visualize_graph(G, pos, node_labels, node_routes, MODE, 
-                   directed=DIRECTED_EDGES, show_flow_labels=SHOW_FLOW_LABELS)
+                   directed=DIRECTED_EDGES, show_flow_labels=SHOW_FLOW_LABELS, 
+                   show_travel_time_labels=SHOW_TRAVEL_TIMES_LABELS)
 
 
 if __name__ == "__main__":
