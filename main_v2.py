@@ -5,6 +5,8 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from flow import add_bus_flow_to_edges, add_rail_flow_to_edges
+from shortest_path import (add_transfer_edges, find_and_compute_shortest_path,
+                           get_path_edges)
 from travel_times_v3 import (add_travel_times_to_graph,
                              load_travel_times_from_gtfs)
 from utils import ROUTE_COLORS, filter_routes_by_type, load_gtfs_data
@@ -28,23 +30,25 @@ ROUTE_TYPES = {
 
 BUS_LINES = ["1", "70", "747", "64", "68", "47", "741", "83"]  # Only lines that >= 3 people listed (747=CT2, 741=SL1)
 
-SIMULATE_LINE_CLOSURE = ""  # List of lines to close (e.g. "70", "747", "Red", "Green-D", or empty string to indicate no line closure)
+SHORTEST_PATH_SRC_DST = ("West Campus", "Central Square")
+
+SIMULATE_LINE_CLOSURE = "47"  # List of lines to close (e.g. "70", "747", "Red", "Green-D", or empty string to indicate no line closure)
 
 # Radius for identifying stations near key/campus locations (in degrees, approximately 200 meters)
-KEY_LOCATION_RADIUS = 0.004
+KEY_LOCATION_RADIUS = 0.00275
 
 # Key locations to mark on the map (longitude, latitude)
 KEY_LOCATIONS = {
     'Central Square': {'lon': -71.1038, 'lat': 42.3655},
     'Harvard Square': {'lon': -71.1190, 'lat': 42.3736},
-    'Back Bay': {'lon': -71.0810, 'lat': 42.3503},
-    'Fenway/Kenmore': {'lon': -71.0972, 'lat': 42.3472},
-    'Downtown': {'lon': -71.0589, 'lat': 42.3601}
+    'Back Bay': {'lon': -71.078147, 'lat': 42.348974},
+    'Fenway/Kenmore': {'lon': -71.095569, 'lat': 42.348049},
+    'Downtown': {'lon': -71.061225, 'lat': 42.356518}
 }
 
 # Campus locations to mark on the map (longitude, latitude)
 CAMPUS_LOCATIONS = {
-    'West Campus': {'lon': -71.10475, 'lat': 42.35396},  # Approximately West Briggs field
+    'West Campus': {'lon': -71.10755, 'lat': 42.35515},  # Approximately West Briggs field
     'East Campus': {'lon': -71.085528, 'lat': 42.360472}
 }
 
@@ -224,11 +228,12 @@ def create_edges_from_gtfs(stops, stop_times, trips, routes, route_types,
                 'trip_id': trip_id
             })
     
-    # Remove duplicate edges (same source->target pairs)
+    # Remove duplicate edges (same source->target->route combinations)
     # Note: For directed graphs, A->B and B->A are different edges and both kept
+    # Keep route_id in duplicate check so different routes can share the same physical edge
     edges_df = pd.DataFrame(edges)
     if len(edges_df) > 0:
-        edges_df = edges_df.drop_duplicates(subset=['source_id', 'target_id'])
+        edges_df = edges_df.drop_duplicates(subset=['source_id', 'target_id', 'route_id'])
     
     # Add ridership flow data if paths provided
     if ridership_filepath:
@@ -441,7 +446,7 @@ def create_arrow_triangle(curve_x, curve_y, color, arrow_distance=0.0019, arrow_
     return arrow_trace
 
 
-def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_flow_labels=True, show_travel_time_labels=True):
+def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_flow_labels=True, show_travel_time_labels=True, shortest_path=None, transfer_edges=None):
     """Create an interactive network graph using Plotly with color-coded routes and curved bi-directional edges.
     
     Parameters:
@@ -452,6 +457,10 @@ def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_
         If True, display flow numbers on edges. If False, hide flow labels.
     show_travel_time_labels : bool
         If True, display travel time labels on edges. If False, hide travel time labels.
+    shortest_path : list or None
+        If provided, list of node IDs representing shortest path to highlight in gold.
+    transfer_edges : list or None
+        If provided, list of (u, v) tuples representing transfer edges used in shortest path.
     """
     # Identify bi-directional edges
     bidirectional_edges = set()
@@ -462,6 +471,18 @@ def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_
             bidirectional_edges.add(edge_pair)
     
     print(f"  Found {len(bidirectional_edges)} bi-directional edge pairs")
+    
+    # Prepare shortest path data structures for highlighting
+    shortest_path_edges = set()
+    shortest_path_nodes = set()
+    transfer_edges_set = set()
+    if shortest_path:
+        shortest_path_nodes = set(shortest_path)
+        shortest_path_edges = set(get_path_edges(shortest_path))
+        print(f"  Highlighting shortest path with {len(shortest_path_nodes)} nodes and {len(shortest_path_edges)} edges")
+    if transfer_edges is not None and transfer_edges:
+        transfer_edges_set = set(transfer_edges)
+        print(f"  Highlighting {len(transfer_edges_set)} transfer edges in shortest path")
     
     # Group edges by route for colored visualization
     route_edges = {}
@@ -488,6 +509,11 @@ def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_
             x1, y1 = pos[v]
             weight = data.get('weight', 1)
             flow = data.get('flow', None)
+            
+            # Override color to gold if edge is in shortest path (but not a transfer edge)
+            is_in_shortest_path = (u, v) in shortest_path_edges and (u, v) not in transfer_edges_set
+            edge_color = 'gold' if is_in_shortest_path else color
+            edge_width = 4.0 if is_in_shortest_path else 2.5
             
             # Check if this is part of a bi-directional edge pair
             edge_pair = tuple(sorted([u, v]))
@@ -558,7 +584,7 @@ def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_
                     x=curve_x,
                     y=curve_y,
                     mode='lines',
-                    line=dict(width=2.5, color=color),
+                    line=dict(width=edge_width, color=edge_color),
                     hoverinfo='text',
                     text=hover_text,
                     name=route_id,
@@ -572,10 +598,10 @@ def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_
                     # Use half-size arrows for bus routes
                     is_bus_route = (color == ROUTE_COLORS['default'])
                     if is_bus_route:
-                        arrow_trace = create_arrow_triangle(curve_x, curve_y, color, 
+                        arrow_trace = create_arrow_triangle(curve_x, curve_y, edge_color, 
                                                           arrow_length=0.001, arrow_width=0.0003)
                     else:
-                        arrow_trace = create_arrow_triangle(curve_x, curve_y, color)
+                        arrow_trace = create_arrow_triangle(curve_x, curve_y, edge_color)
                     if arrow_trace:
                         edge_traces.append(arrow_trace)
                 
@@ -624,7 +650,7 @@ def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_
                     x=curve_x,
                     y=curve_y,
                     mode='lines',
-                    line=dict(width=2.5, color=color),
+                    line=dict(width=edge_width, color=edge_color),
                     hoverinfo='text',
                     text=hover_text,
                     name=route_id,
@@ -638,10 +664,10 @@ def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_
                     # Use half-size arrows for bus routes
                     is_bus_route = (color == ROUTE_COLORS['default'])
                     if is_bus_route:
-                        arrow_trace = create_arrow_triangle(curve_x, curve_y, color,
+                        arrow_trace = create_arrow_triangle(curve_x, curve_y, edge_color,
                                                           arrow_length=0.001, arrow_width=0.0003)
                     else:
-                        arrow_trace = create_arrow_triangle(curve_x, curve_y, color)
+                        arrow_trace = create_arrow_triangle(curve_x, curve_y, edge_color)
                     if arrow_trace:
                         edge_traces.append(arrow_trace)
                 
@@ -714,6 +740,40 @@ def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_
             legendgroup='bus_routes'
         )
         legend_traces.append(bus_legend_trace)
+    
+    # Visualize transfer edges used in shortest path as dotted golden lines
+    transfer_edge_traces = []
+    if transfer_edges_set:
+        for u, v in transfer_edges_set:
+            if u not in pos or v not in pos:
+                continue
+            
+            x0, y0 = pos[u]
+            x1, y1 = pos[v]
+            
+            # Draw as straight dotted line
+            transfer_trace = go.Scatter(
+                x=[x0, x1],
+                y=[y0, y1],
+                mode='lines',
+                line=dict(width=3, color='gold', dash='dot'),
+                hoverinfo='text',
+                text=f'{node_labels.get(u, u)} → {node_labels.get(v, v)}<br>Transfer Connection',
+                showlegend=False
+            )
+            transfer_edge_traces.append(transfer_trace)
+        
+        # Add legend entry for transfer edges
+        if transfer_edge_traces:
+            transfer_legend = go.Scatter(
+                x=[None],
+                y=[None],
+                mode='lines',
+                line=dict(width=3, color='gold', dash='dot'),
+                name='Transfer (Walking)',
+                showlegend=True
+            )
+            legend_traces.append(transfer_legend)
     
     # Create node traces grouped by route (for nodes served by that route)
     node_traces = []
@@ -794,6 +854,40 @@ def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_
                     showlegend=False
                 )
                 node_traces.append(node_trace)
+    
+    # Create markers for shortest path nodes (draw before key stations so they're visible)
+    shortest_path_node_traces = []
+    if shortest_path_nodes:
+        sp_node_x = []
+        sp_node_y = []
+        sp_node_text = []
+        
+        for node in shortest_path_nodes:
+            if node in pos:
+                x, y = pos[node]
+                sp_node_x.append(x)
+                sp_node_y.append(y)
+                station_name = node_labels.get(node, node)
+                sp_node_text.append(station_name)
+        
+        if sp_node_x:
+            sp_node_trace = go.Scatter(
+                x=sp_node_x,
+                y=sp_node_y,
+                mode='markers+text',
+                text=sp_node_text,
+                textposition='top center',
+                textfont=dict(size=10, color='darkgoldenrod', weight='bold'),
+                marker=dict(
+                    size=15,
+                    color='gold',
+                    line=dict(width=3, color='darkgoldenrod')
+                ),
+                hovertemplate='<b>%{text}</b><br>[Shortest Path]<extra></extra>',
+                showlegend=True,
+                name='Shortest Path'
+            )
+            shortest_path_node_traces.append(sp_node_trace)
     
     # Create star markers for stations near key/campus locations
     key_station_traces = []
@@ -906,19 +1000,22 @@ def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_
     
     # Create figure
     # Note: Traces are added in order, with later traces appearing on top
-    # Key locations and campus locations are added last so they appear above everything else
+    # Transfer edges are added after regular edges, shortest path nodes are added after regular nodes
     mode_display = mode.replace('_', ' ').title()
-    fig = go.Figure(data=legend_traces + [key_locations_legend, campus_locations_legend] + edge_traces + flow_label_traces + 
-                    travel_time_label_traces + node_traces + bus_node_traces_with_labels + bus_node_traces_without_labels + 
-                    key_station_traces + key_location_traces + campus_location_traces)
+    fig = go.Figure(data=legend_traces + [key_locations_legend, campus_locations_legend] + edge_traces + transfer_edge_traces + 
+                    flow_label_traces + travel_time_label_traces + node_traces + bus_node_traces_with_labels + 
+                    bus_node_traces_without_labels + shortest_path_node_traces + key_station_traces + key_location_traces + 
+                    campus_location_traces)
     
     # Calculate trace indices for toggle buttons
     num_legend_traces = len(legend_traces) + 2  # +2 for key_locations_legend and campus_locations_legend
     num_edge_traces = len(edge_traces)
+    num_transfer_edge_traces = len(transfer_edge_traces)
     num_flow_label_traces = len(flow_label_traces)
     num_travel_time_label_traces = len(travel_time_label_traces)
     num_node_traces = len(node_traces)
     num_bus_traces = len(bus_node_traces_with_labels)
+    num_shortest_path_node_traces = len(shortest_path_node_traces)
     num_key_station_traces = len(key_station_traces)
     num_key_location_traces = len(key_location_traces)
     num_campus_location_traces = len(campus_location_traces)
@@ -929,6 +1026,8 @@ def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_
     idx += num_legend_traces
     edge_idx = idx
     idx += num_edge_traces
+    transfer_edge_idx = idx
+    idx += num_transfer_edge_traces
     flow_idx = idx
     idx += num_flow_label_traces
     travel_time_idx = idx
@@ -939,6 +1038,8 @@ def visualize_graph(G, pos, node_labels, node_routes, mode, directed=True, show_
     idx += num_bus_traces
     bus_without_labels_idx = idx
     idx += num_bus_traces
+    shortest_path_node_idx = idx
+    idx += num_shortest_path_node_traces
     key_station_idx = idx
     idx += num_key_station_traces
     key_location_idx = idx
@@ -1133,6 +1234,7 @@ def main():
             ridership_type='rail',
             normalize_flow=NORMALIZE_FLOW
         )
+        print(f"  Created {len(edges_df)} edges")
     elif MODE == 'bus_only':
         # Bus only with ridership (filtered to specific bus lines)
         # Note: Bus data already shows average_load (passengers per bus), so don't normalize
@@ -1145,6 +1247,7 @@ def main():
             specific_routes=BUS_LINES,
             normalize_flow=False  # Bus data is already per-bus load
         )
+        print(f"  Created {len(edges_df)} edges")
     else:  # bus_and_rail
         # Create rail edges with rail ridership
         print("  Creating rail edges...")
@@ -1180,10 +1283,60 @@ def main():
         total_with_flow = (edges_df['flow'] > 0).sum()
         print(f"  Combined: {len(edges_df)} total edges, {total_with_flow} with flow data")
     
+    # Handle line closure simulation
+    if SIMULATE_LINE_CLOSURE:
+        print(f"\n*** SIMULATING LINE CLOSURE: {SIMULATE_LINE_CLOSURE} ***")
+        all_route_ids = sorted(edges_df['route_id'].unique())
+        print(f"  Available route IDs in graph: {all_route_ids}")
+        print(f"  Route ID data type: {edges_df['route_id'].dtype}")
+        print(f"  Closure value type: {type(SIMULATE_LINE_CLOSURE)}, value: '{SIMULATE_LINE_CLOSURE}'")
+        
+        # Convert SIMULATE_LINE_CLOSURE to the same type as route_id for proper comparison
+        closure_value = str(SIMULATE_LINE_CLOSURE) if edges_df['route_id'].dtype == 'object' else SIMULATE_LINE_CLOSURE
+        
+        original_edges = len(edges_df)
+        
+        # Check which edges match the closed line
+        matching_edges = edges_df[edges_df['route_id'] == closure_value]
+        print(f"  Found {len(matching_edges)} edges matching closed line '{closure_value}'")
+        
+        # Show sample of what's being removed
+        if len(matching_edges) > 0:
+            sample = matching_edges[['source_id', 'target_id', 'route_id']].head(3)
+            print(f"  Sample edges to remove:\n{sample}")
+        
+        # Filter out edges from the closed line
+        edges_df = edges_df[edges_df['route_id'] != closure_value].copy()
+        
+        removed_edges = original_edges - len(edges_df)
+        print(f"  Removed {removed_edges} edges from line {closure_value}")
+        print(f"  Remaining edges: {len(edges_df)}")
+        print(f"  Remaining route IDs: {sorted(edges_df['route_id'].unique())}")
+        
+        if len(edges_df) == 0:
+            print("  ERROR: No edges remaining after line closure!")
+            return
+        
+        if removed_edges == 0:
+            print(f"  WARNING: No edges were removed! Line '{closure_value}' not found in route IDs.")
+            print(f"  Did you mean one of these? {all_route_ids}")
+    
     # Create graph with geographic positions
-    print("Building network graph...")
+    print("\nBuilding network graph...")
     G, pos, node_labels, node_routes = create_graph_with_positions(edges_df, stops)
     print(f"  {G.number_of_nodes()} stations, {G.number_of_edges()} connections")
+    
+    # Debug: Show which routes serve each node (useful for verifying shared stops)
+    if SIMULATE_LINE_CLOSURE:
+        print(f"\n  Checking for nodes that serve multiple routes (including near-closure routes):")
+        multi_route_nodes = [(node, routes) for node, routes in node_routes.items() if len(routes) > 1]
+        if multi_route_nodes:
+            print(f"  Found {len(multi_route_nodes)} nodes serving multiple routes")
+            # Show a few examples
+            for node, routes in multi_route_nodes[:5]:
+                print(f"    - {node_labels.get(node, node)}: routes {sorted(routes)}")
+        else:
+            print(f"  No nodes serving multiple routes found")
     
     # Identify stations near key/campus locations
     print("\nIdentifying stations near key/campus locations...")
@@ -1201,8 +1354,8 @@ def main():
         else:
             G.nodes[node]['is_key_station'] = False
     
-    # Add travel time weights to edges (only for rail modes)
-    if SHOW_TRAVEL_TIMES_LABELS and MODE in ['rail_only', 'bus_and_rail']:
+    # Add travel time weights to edges (ALWAYS load for pathfinding, regardless of display)
+    if MODE in ['rail_only', 'bus_and_rail']:
         print("\nAdding travel time data from GTFS schedules...")
         try:
             travel_times_df = load_travel_times_from_gtfs(gtfs_folder, stops_df=stops)
@@ -1211,11 +1364,27 @@ def main():
             print(f"  Warning: Could not load travel time data: {e}")
             print(f"  Continuing without travel times...")
     
+    # Compute shortest path if source and destination are specified
+    # Note: transfer edges are added internally to a copy of the graph for pathfinding
+    shortest_path = None
+    transfer_edges = []
+    if SHORTEST_PATH_SRC_DST:
+        source_location, target_location = SHORTEST_PATH_SRC_DST
+        all_locations = {}
+        all_locations.update(KEY_LOCATIONS)
+        all_locations.update(CAMPUS_LOCATIONS)
+        
+        shortest_path, path_stats, transfer_edges = find_and_compute_shortest_path(
+            source_location, target_location, G, pos, node_labels, all_locations,
+            transfer_radius=KEY_LOCATION_RADIUS, transfer_time=480.0, node_routes=node_routes
+        )  # 60 seconds = ~1 minute walk between nearby stops
+    
     # Generate interactive visualization
     print("\nGenerating visualization...")
     visualize_graph(G, pos, node_labels, node_routes, MODE, 
                    directed=DIRECTED_EDGES, show_flow_labels=SHOW_FLOW_LABELS, 
-                   show_travel_time_labels=SHOW_TRAVEL_TIMES_LABELS)
+                   show_travel_time_labels=SHOW_TRAVEL_TIMES_LABELS,
+                   shortest_path=shortest_path, transfer_edges=transfer_edges)
 
 
 if __name__ == "__main__":
