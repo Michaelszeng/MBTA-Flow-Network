@@ -125,8 +125,7 @@ def add_travel_times_to_graph(G, travel_times_df):
             G[source][target]['travel_time_sec'] = travel_times_dict[(source, target)]
             edges_matched += 1
     
-    coverage_pct = (edges_matched / G.number_of_edges() * 100) if G.number_of_edges() > 0 else 0
-    print(f"  Added travel times to {edges_matched}/{G.number_of_edges()} edges ({coverage_pct:.1f}% coverage)")
+    print(f"  Added travel times to {edges_matched}/{G.number_of_edges()} edges")
     
     return edges_matched
 

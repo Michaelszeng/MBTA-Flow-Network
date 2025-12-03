@@ -4,7 +4,10 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-from flow import add_bus_flow_to_edges, add_rail_flow_to_edges
+from closures import (close_station, filter_closed_lines, reroute_line_closure,
+                      reroute_station_closure)
+from flow import (add_bus_flow_to_edges, add_rail_flow_to_edges,
+                  calculate_trips_from_headway)
 from shortest_path import (add_transfer_edges, find_and_compute_shortest_path,
                            get_path_edges)
 from travel_times_v3 import (add_travel_times_to_graph,
@@ -30,9 +33,12 @@ ROUTE_TYPES = {
 
 BUS_LINES = ["1", "70", "747", "64", "68", "47", "741", "83"]  # Only lines that >= 3 people listed (747=CT2, 741=SL1)
 
-SHORTEST_PATH_SRC_DST = ("West Campus", "Central Square")
+SHORTEST_PATH_SRC_DST = None
+# SHORTEST_PATH_SRC_DST = ("East Campus", "Fenway/Kenmore")
 
-SIMULATE_LINE_CLOSURE = "47"  # List of lines to close (e.g. "70", "747", "Red", "Green-D", or empty string to indicate no line closure)
+SIMULATE_LINE_CLOSURE = ""  # List of lines to close (e.g. "70", "747", "Red", "Green-D", or empty string to indicate no line closure)
+
+SIMULATE_STOP_STATION_CLOSURE = ""  # Station or stop name to close (e.g. "Kendall/MIT", "Park Street", "Amesbury St @ Vassar St", or empty string for no closure)
 
 # Radius for identifying stations near key/campus locations (in degrees, approximately 200 meters)
 KEY_LOCATION_RADIUS = 0.00275
@@ -144,30 +150,16 @@ def identify_key_stations(G, pos, key_locations, campus_locations, radius):
 def create_edges_from_gtfs(stops, stop_times, trips, routes, route_types, 
                            ridership_filepath=None, stop_orders_filepath=None,
                            day_type='Weekday', time_period='PM_PEAK',
-                           ridership_type='rail', specific_routes=None, normalize_flow=True):
+                           ridership_type='rail', specific_routes=None, normalize_flow=True,
+                           trips_count=None):
     """
     Create network edges from GTFS data with optional ridership flow data.
     
     Parameters:
     -----------
-    stops, stop_times, trips, routes : pd.DataFrame
-        GTFS data
-    route_types : list
-        List of route types to include (e.g., [0, 1] for rail)
-    ridership_filepath : str or Path, optional
-        Path to ridership CSV file. If provided, adds flow column.
-    stop_orders_filepath : str or Path, optional
-        Path to stop orders CSV file. Required for rail ridership.
-    day_type : str
-        Day type for ridership data (default: 'Weekday')
-    time_period : str
-        Time period for ridership data (default: 'PM_PEAK')
-    ridership_type : str
-        Type of ridership data: 'rail' or 'bus' (default: 'rail')
-    specific_routes : list, optional
-        List of specific route IDs to include. If provided, only these routes will be included.
-    normalize_flow : bool
-        If True (rail only), normalize flow to average passengers per train using 5-minute headway assumption (default: True)
+    ...
+    trips_count : int, optional
+        Pre-calculated trip count for normalization.
     """
     # Filter routes by type (i.e. bus_only, rail_only, bus_and_rail)
     filtered_routes = filter_routes_by_type(routes, route_types)
@@ -246,7 +238,8 @@ def create_edges_from_gtfs(stops, stop_times, trips, routes, route_types,
                 stop_orders_filepath,
                 day_type=day_type,
                 time_period=time_period,
-                normalize=normalize_flow
+                normalize=normalize_flow,
+                trips_count=trips_count
             )
         elif ridership_type == 'bus':
             edges_df = add_bus_flow_to_edges(
@@ -331,10 +324,10 @@ def create_graph_with_positions(edges_df, stops):
             if 'routes' not in G[source_id][target_id]:
                 G[source_id][target_id]['routes'] = set()
             G[source_id][target_id]['routes'].add(route_id)
-            # Sum flows if edge already exists (shouldn't happen often)
-            if flow is not None and 'flow' in G[source_id][target_id]:
-                G[source_id][target_id]['flow'] += flow
-            elif flow is not None:
+            # For flow: Keep the first non-zero flow value, don't sum
+            # (Multiple branches like Green-B, Green-C on same segment should show
+            # flow per train, not sum of all branches)
+            if flow is not None and flow > 0 and 'flow' not in G[source_id][target_id]:
                 G[source_id][target_id]['flow'] = flow
         else:
             edge_attrs = {'weight': 1, 'routes': {route_id}}
@@ -1220,6 +1213,11 @@ def main():
         print("Error: Invalid MODE specified.")
         return
     
+    # Note: We don't pre-calculate trips_count here because different routes have
+    # different headways. The normalization logic in flow.py will calculate per-edge
+    # based on each route's specific headway and how many branches use each edge.
+    trips_count = None
+    
     # Create edges from GTFS data with ridership flow data
     print("\nCreating network edges...")
     
@@ -1232,7 +1230,8 @@ def main():
             day_type=DAY_TYPE,
             time_period=TIME_PERIOD,
             ridership_type='rail',
-            normalize_flow=NORMALIZE_FLOW
+            normalize_flow=NORMALIZE_FLOW,
+            trips_count=trips_count
         )
         print(f"  Created {len(edges_df)} edges")
     elif MODE == 'bus_only':
@@ -1245,7 +1244,8 @@ def main():
             time_period=TIME_PERIOD,
             ridership_type='bus',
             specific_routes=BUS_LINES,
-            normalize_flow=False  # Bus data is already per-bus load
+            normalize_flow=False,  # Bus data is already per-bus load
+            trips_count=None
         )
         print(f"  Created {len(edges_df)} edges")
     else:  # bus_and_rail
@@ -1258,7 +1258,8 @@ def main():
             day_type=DAY_TYPE,
             time_period=TIME_PERIOD,
             ridership_type='rail',
-            normalize_flow=NORMALIZE_FLOW
+            normalize_flow=NORMALIZE_FLOW,
+            trips_count=trips_count
         )
         rail_with_flow = (rail_edges['flow'] > 0).sum() if 'flow' in rail_edges.columns else 0
         print(f"    Rail: {len(rail_edges)} edges, {rail_with_flow} with flow data")
@@ -1273,7 +1274,8 @@ def main():
             time_period=TIME_PERIOD,
             ridership_type='bus',
             specific_routes=BUS_LINES,
-            normalize_flow=False  # Bus data is already per-bus load
+            normalize_flow=False,  # Bus data is already per-bus load
+            trips_count=None
         )
         bus_with_flow = (bus_edges['flow'] > 0).sum() if 'flow' in bus_edges.columns else 0
         print(f"    Bus: {len(bus_edges)} edges, {bus_with_flow} with flow data")
@@ -1285,46 +1287,26 @@ def main():
     
     # Handle line closure simulation
     if SIMULATE_LINE_CLOSURE:
-        print(f"\n*** SIMULATING LINE CLOSURE: {SIMULATE_LINE_CLOSURE} ***")
-        all_route_ids = sorted(edges_df['route_id'].unique())
-        print(f"  Available route IDs in graph: {all_route_ids}")
-        print(f"  Route ID data type: {edges_df['route_id'].dtype}")
-        print(f"  Closure value type: {type(SIMULATE_LINE_CLOSURE)}, value: '{SIMULATE_LINE_CLOSURE}'")
+        closure_value = str(SIMULATE_LINE_CLOSURE)
+        result = filter_closed_lines(edges_df, closure_value)
         
-        # Convert SIMULATE_LINE_CLOSURE to the same type as route_id for proper comparison
-        closure_value = str(SIMULATE_LINE_CLOSURE) if edges_df['route_id'].dtype == 'object' else SIMULATE_LINE_CLOSURE
-        
-        original_edges = len(edges_df)
-        
-        # Check which edges match the closed line
-        matching_edges = edges_df[edges_df['route_id'] == closure_value]
-        print(f"  Found {len(matching_edges)} edges matching closed line '{closure_value}'")
-        
-        # Show sample of what's being removed
-        if len(matching_edges) > 0:
-            sample = matching_edges[['source_id', 'target_id', 'route_id']].head(3)
-            print(f"  Sample edges to remove:\n{sample}")
-        
-        # Filter out edges from the closed line
-        edges_df = edges_df[edges_df['route_id'] != closure_value].copy()
-        
-        removed_edges = original_edges - len(edges_df)
-        print(f"  Removed {removed_edges} edges from line {closure_value}")
-        print(f"  Remaining edges: {len(edges_df)}")
-        print(f"  Remaining route IDs: {sorted(edges_df['route_id'].unique())}")
-        
-        if len(edges_df) == 0:
+        if result[0] is None:
             print("  ERROR: No edges remaining after line closure!")
             return
         
-        if removed_edges == 0:
-            print(f"  WARNING: No edges were removed! Line '{closure_value}' not found in route IDs.")
-            print(f"  Did you mean one of these? {all_route_ids}")
+        edges_df = result[0]  # Update edges_df with filtered version
     
     # Create graph with geographic positions
     print("\nBuilding network graph...")
     G, pos, node_labels, node_routes = create_graph_with_positions(edges_df, stops)
     print(f"  {G.number_of_nodes()} stations, {G.number_of_edges()} connections")
+    
+    # Handle station/stop closure simulation
+    station_closure_info = None
+    if SIMULATE_STOP_STATION_CLOSURE:
+        station_closure_info = close_station(G, pos, node_labels, SIMULATE_STOP_STATION_CLOSURE, edges_df)
+        if station_closure_info:
+            print(f"  After station closure: {G.number_of_nodes()} stations, {G.number_of_edges()} connections")
     
     # Debug: Show which routes serve each node (useful for verifying shared stops)
     if SIMULATE_LINE_CLOSURE:
@@ -1363,6 +1345,109 @@ def main():
         except Exception as e:
             print(f"  Warning: Could not load travel time data: {e}")
             print(f"  Continuing without travel times...")
+    
+    # Verify line closure was successful (if applicable) and REROUTE DEMAND
+    if SIMULATE_LINE_CLOSURE:
+        closure_value = str(SIMULATE_LINE_CLOSURE)
+        def matches_closure(route_id):
+            route_id_str = str(route_id)
+            if route_id_str == closure_value:
+                return True
+            if route_id_str.startswith(closure_value + "-"):
+                return True
+            return False
+        
+        routes_in_graph = set()
+        for u, v, data in G.edges(data=True):
+            routes_in_graph.update(data.get('routes', set()))
+        
+        closed_routes_found = [r for r in routes_in_graph if matches_closure(r)]
+        if closed_routes_found:
+            print(f"\n  ERROR: Closed line variants still found in graph: {closed_routes_found}")
+        else:
+            print(f"\n  Verified: Closed line '{closure_value}' successfully removed from graph")
+            print(f"  Active routes in graph: {sorted(routes_in_graph)}")
+            
+            # Perform Gravity-Based Rerouting
+            try:
+                # Load raw ridership data for the rerouting logic
+                rail_data = pd.read_csv(rail_ridership_file)
+                rail_data['parent_stop_id'] = rail_data['parent_station']
+                
+                bus_data = pd.read_csv(bus_ridership_file)
+                stops_dict = stops.set_index('stop_id')['parent_station'].to_dict()
+                def get_parent(stop_id):
+                    sid = str(stop_id)
+                    return stops_dict.get(sid, sid) if pd.notna(stops_dict.get(sid)) else sid
+                bus_data['parent_stop_id'] = bus_data['stop_id'].apply(get_parent)
+                
+                # Concatenate relevant data
+                all_ridership = pd.concat([
+                    rail_data[['route_id', 'parent_stop_id', 'average_ons', 'average_offs']],
+                    bus_data[['route_id', 'parent_stop_id', 'average_ons', 'average_offs']]
+                ], ignore_index=True)
+                
+                # Create stops coordinate dictionary
+                stops_coord_dict = stops.set_index('stop_id')[['stop_lat', 'stop_lon']].to_dict('index')
+                
+                # Calculate normalization factor for rerouting
+                # Note: For multi-route networks, this is an approximation.
+                # We use a representative route (Red Line) as the baseline.
+                # The rerouted flows will be distributed proportionally.
+                normalization_factor = 1.0
+                if NORMALIZE_FLOW:
+                    # Use Red Line as baseline for normalization (12 min headway)
+                    normalization_factor = calculate_trips_from_headway(TIME_PERIOD, 'Red')
+                    print(f"  Using baseline normalization factor: {normalization_factor} (Red Line)")
+                
+                # Reroute the demand
+                reroute_line_closure(G, pos, stops, closure_value, all_ridership, 
+                                   stops_coord_dict, normalization_factor)
+                              
+            except Exception as e:
+                print(f"  Error during line closure rerouting: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    # Handle station closure rerouting
+    if station_closure_info and SIMULATE_STOP_STATION_CLOSURE:
+        try:
+            # Load ridership data if not already loaded
+            if 'all_ridership' not in locals():
+                rail_data = pd.read_csv(rail_ridership_file)
+                rail_data['parent_stop_id'] = rail_data['parent_station']
+                
+                bus_data = pd.read_csv(bus_ridership_file)
+                stops_dict_temp = stops.set_index('stop_id')['parent_station'].to_dict()
+                def get_parent(stop_id):
+                    sid = str(stop_id)
+                    return stops_dict_temp.get(sid, sid) if pd.notna(stops_dict_temp.get(sid)) else sid
+                bus_data['parent_stop_id'] = bus_data['stop_id'].apply(get_parent)
+                
+                all_ridership = pd.concat([
+                    rail_data[['route_id', 'parent_stop_id', 'average_ons', 'average_offs']],
+                    bus_data[['route_id', 'parent_stop_id', 'average_ons', 'average_offs']]
+                ], ignore_index=True)
+                
+                stops_coord_dict = stops.set_index('stop_id')[['stop_lat', 'stop_lon']].to_dict('index')
+            
+            # Calculate normalization factor for station closure rerouting
+            # Note: For multi-route networks, this is an approximation.
+            # We use a representative route (Red Line) as the baseline.
+            normalization_factor = 1.0
+            if NORMALIZE_FLOW:
+                # Use Red Line as baseline for normalization (12 min headway)
+                normalization_factor = calculate_trips_from_headway(TIME_PERIOD, 'Red')
+                print(f"  Using baseline normalization factor: {normalization_factor} (Red Line)")
+            
+            # Reroute the station closure demand
+            reroute_station_closure(G, pos, station_closure_info, all_ridership, 
+                                   stops_coord_dict, normalization_factor)
+        
+        except Exception as e:
+            print(f"  Error during station closure rerouting: {e}")
+            import traceback
+            traceback.print_exc()
     
     # Compute shortest path if source and destination are specified
     # Note: transfer edges are added internally to a copy of the graph for pathfinding

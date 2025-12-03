@@ -17,24 +17,45 @@ TIME_PERIOD_RANGES = {
     'OFF_PEAK': ('09:00:00', '14:59:59')  # Fallback for generic off-peak
 }
 
-# Average headway (minutes between trains) for rail lines
-AVERAGE_HEADWAY_MINUTES = 5.0  # Assume one train every 5 minutes
+# Average headway (minutes between trains) for each rail line
+# Based on MBTA peak hour schedules (sources: MBTA official schedules, CTPS data)
+# 
+# These represent PER-BRANCH or PER-LINE headways. For multi-branch lines,
+# the normalization code will automatically detect how many branches pass through
+# each edge and calculate the combined frequency accordingly.
+#
+AVERAGE_HEADWAY_MINUTES = {
+    'Red': 12.0,       # Per branch: Ashmont and Braintree branches each run ~12 min
+    'Orange': 9.0,     # 9 min during peak hours (single line, no branches)
+    'Blue': 10.0,      # 10 min during peak hours (single line, no branches)
+    'Green': 8.0,      # Per branch: each branch runs ~8 min
+    'Green-B': 8.0,    # Green Line Branch B: 8 min headway
+    'Green-C': 8.0,    # Green Line Branch C: 8 min headway
+    'Green-D': 8.0,    # Green Line Branch D: 8 min headway
+    'Green-E': 8.0,    # Green Line Branch E: 8 min headway
+    'Mattapan': 12.0,  # Mattapan Trolley (less frequent, part of Red Line system)
+}
 
-def calculate_trips_from_headway(time_period):
+def calculate_trips_from_headway(time_period, route_id='Red'):
     """
-    Calculate number of trips based on time period duration and assumed headway.
-    Simple approach: assumes one train every AVERAGE_HEADWAY_MINUTES in each direction.
+    Calculate number of trips based on time period duration and route-specific headway.
+    Simple approach: assumes one train every AVERAGE_HEADWAY_MINUTES[route_id] in each direction.
     
     Parameters:
     -----------
     time_period : str
         Time period name (e.g., 'PM_PEAK', 'EVENING')
+    route_id : str
+        Route/line identifier (e.g., 'Red', 'Orange', 'Blue', 'Green')
     
     Returns:
     --------
     int
         Estimated number of trips in one direction during the time period
     """
+    # Get headway for this route (default to 8 minutes if not found)
+    headway = AVERAGE_HEADWAY_MINUTES.get(route_id, 8.0)
+    
     # Get time range for the period
     if time_period not in TIME_PERIOD_RANGES:
         print(f"    Warning: Time period '{time_period}' not defined. Using 4-hour default.")
@@ -54,10 +75,9 @@ def calculate_trips_from_headway(time_period):
             duration_minutes = end_minutes - start_minutes
     
     # Calculate number of trips: duration / headway
-    num_trips = int(duration_minutes / AVERAGE_HEADWAY_MINUTES)
+    num_trips = int(duration_minutes / headway)
     
-    print(f"    Using simplified trip calculation: {num_trips} trips per direction")
-    print(f"    ({duration_minutes} minutes ÷ {AVERAGE_HEADWAY_MINUTES} min/train = ~{num_trips} trains)")
+    print(f"    Using simplified trip calculation for {route_id}: {num_trips} trips per direction (headway: {headway} min)")
     
     return num_trips
 
@@ -131,6 +151,10 @@ def add_bus_flow_to_edges(edges_df, ridership_filepath, stops_df,
             continue
         
         # Try to find consecutive stops in any route variant/direction
+        # Important: Multiple variants may serve the same edge, so we need to collect
+        # ALL matching variants and compute a weighted average based on trip counts
+        matching_variants = []
+        
         for (variant, direction), variant_data in route_data.groupby(['route_variant', 'direction_id']):
             variant_data = variant_data.sort_values('stop_sequence')
             
@@ -145,15 +169,20 @@ def add_bus_flow_to_edges(edges_df, ridership_filepath, stops_df,
             for _, source_rec in source_records.iterrows():
                 for _, target_rec in target_records.iterrows():
                     if target_rec['stop_sequence'] == source_rec['stop_sequence'] + 1:
-                        # Found consecutive stops! Use the load at source as flow
-                        flow_value = source_rec['average_load']
-                        edges_with_flow.at[idx, 'flow'] = flow_value
+                        # Found consecutive stops! Collect this variant's data
+                        matching_variants.append({
+                            'average_load': source_rec['average_load'],
+                            'num_trips': source_rec['num_trips']
+                        })
                         break
-                if edges_with_flow.at[idx, 'flow'] > 0:
-                    break
-            
-            if edges_with_flow.at[idx, 'flow'] > 0:
-                break
+        
+        # Compute weighted average flow across all matching variants
+        if matching_variants:
+            total_trips = sum(v['num_trips'] for v in matching_variants)
+            if total_trips > 0:
+                # Weighted average: sum(load * trips) / sum(trips)
+                weighted_load = sum(v['average_load'] * v['num_trips'] for v in matching_variants) / total_trips
+                edges_with_flow.at[idx, 'flow'] = weighted_load
     
     # Note: Bus data already represents average_load (per-bus), so normalization not needed
     # This section is kept for compatibility but normalize should be False for buses
@@ -163,29 +192,20 @@ def add_bus_flow_to_edges(edges_df, ridership_filepath, stops_df,
 
 def add_rail_flow_to_edges(edges_df, ridership_filepath, stop_orders_filepath, 
                            day_type='Weekday', time_period='PM_PEAK',
-                           normalize=True):
+                           normalize=True, trips_count=None, route_id=None):
     """
     Add ridership flow data to edges DataFrame for rail lines.
     
     Parameters:
     -----------
-    edges_df : pd.DataFrame
-        DataFrame with columns: source_id, target_id, route_id
-    ridership_filepath : str or Path
-        Path to Fall 2023 rail ridership CSV
-    stop_orders_filepath : str or Path
-        Path to MBTA_Rapid_Transit_Stop_Orders.csv
-    day_type : str
-        Day type to filter (e.g., 'Weekday', 'Saturday', 'Sunday')
-    time_period : str
-        Time period to filter (e.g., 'PM_PEAK', 'AM_PEAK', 'OFF_PEAK')
-    normalize : bool
-        If True, normalize flow to average passengers per train (assumes 5-minute headways)
-    
-    Returns:
-    --------
-    pd.DataFrame
-        edges_df with added 'flow' column (normalized if normalize=True)
+    ...
+    trips_count : int, optional
+        Number of trips to use for normalization. If None and normalize=True,
+        it will be calculated from time_period.
+    route_id : str, optional
+        Route/line identifier for calculating trips from headway. If None,
+        will attempt to determine from edges_df.
+    ...
     """
     # Load ridership data
     ridership = pd.read_csv(ridership_filepath)
@@ -265,6 +285,8 @@ def add_rail_flow_to_edges(edges_df, ridership_filepath, stop_orders_filepath,
                             ]
                             
                             if len(flow_data) > 0:
+                                # Assign the FULL aggregated flow to this edge
+                                # (it represents all branches combined on this segment)
                                 flow_value = flow_data['average_flow'].iloc[0]
                                 edge_flows.append(flow_value)
                                 edge_directions.append(direction)
@@ -282,16 +304,64 @@ def add_rail_flow_to_edges(edges_df, ridership_filepath, stop_orders_filepath,
     # Normalize by trip count if requested
     if normalize:
         print("  Normalizing rail flow by estimated trip count...")
-        # Calculate trips based on headway assumption (simple approach)
-        trips_per_direction = calculate_trips_from_headway(time_period)
         
-        # Normalize: flow per train = total flow / number of trips
-        # The flow data is already directional, so we divide by trips in that direction
+        # For multi-branch lines (e.g., Green), we need to detect whether each edge
+        # is on a trunk section (multiple branches) or branch-only section
+        # to use the correct train frequency for normalization
+        
+        # Build a map of which edges are on trunk vs branch sections
+        edge_branch_counts = {}
+        for idx, edge in edges_with_flow.iterrows():
+            source_id = edge['source_id']
+            target_id = edge['target_id']
+            edge_route = edge['route_id']
+            
+            # Map to ridership route
+            ridership_route = route_mapping.get(edge_route, edge_route)
+            
+            # Count how many different route patterns (branches) include this edge
+            # by checking stop_orders for all patterns of this base route
+            route_patterns = stop_orders[stop_orders['route_id'] == ridership_route]
+            
+            branches_using_edge = 0
+            for pattern_key, pattern_stops in route_patterns.groupby(['first_stop', 'last_stop']):
+                pattern_stops = pattern_stops.sort_values('stop_order')
+                stop_list = pattern_stops['stop_id'].tolist()
+                
+                # Check if this edge (source -> target) appears in this pattern
+                try:
+                    source_idx = stop_list.index(source_id)
+                    if source_idx + 1 < len(stop_list) and stop_list[source_idx + 1] == target_id:
+                        branches_using_edge += 1
+                except ValueError:
+                    continue
+            
+            edge_branch_counts[idx] = max(1, branches_using_edge)  # At least 1
+        
+        # Normalize each edge: flow per train = total flow / total trips
         for idx, edge in edges_with_flow.iterrows():
             flow = edge.get('flow', 0)
-            if flow > 0:
-                edges_with_flow.at[idx, 'flow'] = flow / trips_per_direction
+            if flow <= 0:
+                continue
+                
+            edge_route = edge['route_id']
+            ridership_route = route_mapping.get(edge_route, edge_route)
+            num_branches = edge_branch_counts.get(idx, 1)
+            
+            # Calculate TOTAL trips on this segment
+            # If multiple branches pass through (e.g., Green trunk), we need trips from ALL branches
+            if trips_count is None:
+                # Get trips per individual branch
+                trips_per_branch = calculate_trips_from_headway(time_period, edge_route)
+                # Total trips = trips_per_branch × number of branches using this segment
+                total_trips = trips_per_branch * num_branches
+            else:
+                total_trips = trips_count
+            
+            # Normalize: passengers per train = total passengers / total trains
+            if total_trips > 0:
+                edges_with_flow.at[idx, 'flow'] = flow / total_trips
         
-        print(f"  Normalized: average flow per train = total flow / {trips_per_direction} trips")
+        print(f"  Normalized: average flow per train (accounting for branch overlap)")
     
     return edges_with_flow
